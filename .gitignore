@@ -21,3 +21,5 @@ cli/daemon/dash/dashapp/public/assets/fonts/*/**
 
 # MacOS
 .DS_Store
+config.bat
+node_modules
