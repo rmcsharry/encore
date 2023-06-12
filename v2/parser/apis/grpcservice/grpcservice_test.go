@@ -1,4 +1,4 @@
-package authhandler
+package grpcservice_test
 
 import (
 	"go/ast"
@@ -10,79 +10,65 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/rogpeppe/go-internal/txtar"
+	"google.golang.org/protobuf/reflect/protoreflect"
 
+	"encr.dev/pkg/paths"
 	"encr.dev/v2/internals/pkginfo"
+	"encr.dev/v2/internals/protoparse"
+	"encr.dev/v2/internals/resourcepaths"
 	"encr.dev/v2/internals/schema"
-	. "encr.dev/v2/internals/schema/schematest"
 	"encr.dev/v2/internals/testutil"
+	"encr.dev/v2/parser/apis/api"
+	"encr.dev/v2/parser/apis/grpcservice"
 	"encr.dev/v2/parser/apis/internal/directive"
+	"encr.dev/v2/parser/apis/servicestruct"
 )
 
-func TestParseAuthHandler(t *testing.T) {
+func TestParseEndpoints(t *testing.T) {
 	type testCase struct {
 		name     string
 		imports  []string
 		def      string
-		want     *AuthHandler
+		want     []*api.GRPCEndpoint
 		wantErrs []string
 	}
-
-	ctxParam := Param(Named(TypeInfo("Context")))
-	uidResult := Param(Builtin(schema.UserID))
-
 	tests := []testCase{
 		{
-			name: "basic_legacy",
+			name: "with_grpc_pkgpath",
 			def: `
-//encore:authhandler
-func Foo(ctx context.Context, token string) (auth.UID, error) {}
+//encore:service grpc=path.to.grpc.Service
+type Foo struct {}
+
+func (f *Foo) Bar(ctx context.Context) error { return nil }
+-- proto/path/to/grpc.proto --
+syntax = "proto3";
+package path.to.grpc;
+
+service Service {
+	rpc Bar (BarRequest) returns (BarResponse);
+}
+message BarRequest {}
+message BarResponse {}
 `,
-			want: &AuthHandler{
-				Decl: &schema.FuncDecl{
-					Name: "Foo",
-					Type: schema.FuncType{
-						Params: []schema.Param{
-							ctxParam,
-							Param(String()),
-						},
-						Results: []schema.Param{
-							uidResult,
-							Param(Error()),
+			want: []*api.GRPCEndpoint{
+				{
+					Name:     "Bar",
+					FullName: "path.to.grpc.Service.Bar",
+					Path: &resourcepaths.Path{
+						Segments: []resourcepaths.Segment{
+							{Type: resourcepaths.Literal, Value: "path.to.grpc.Service", ValueType: schema.String},
+							{Type: resourcepaths.Literal, Value: "Bar", ValueType: schema.String},
 						},
 					},
+					Decl: &schema.FuncDecl{Name: "Bar"},
 				},
-				Param: String(),
-			},
-		},
-		{
-			name: "struct_params",
-			def: `
-type Params struct{}
-//encore:authhandler
-func Foo(ctx context.Context, p *Params) (auth.UID, error) {}
-`,
-			want: &AuthHandler{
-				Decl: &schema.FuncDecl{
-					Name: "Foo",
-					Type: schema.FuncType{
-						Params: []schema.Param{
-							ctxParam,
-							Param(Ptr(Named(TypeInfo("Params")))),
-						},
-						Results: []schema.Param{
-							uidResult,
-							Param(Error()),
-						},
-					},
-				},
-				Param: Ptr(Named(TypeInfo("Params"))),
 			},
 		},
 	}
 
 	// testArchive renders the txtar archive to use for a given test.
 	testArchive := func(test testCase) *txtar.Archive {
-		importList := append([]string{"context", "encore.dev/beta/auth"}, test.imports...)
+		importList := append([]string{"context"}, test.imports...)
 		imports := ""
 		if len(importList) > 0 {
 			imports = "import (\n"
@@ -113,6 +99,9 @@ package foo
 
 			l := pkginfo.New(tc.Context)
 			schemaParser := schema.NewParser(tc.Context, l)
+			protoParser := protoparse.NewParser(tc.Errs, []paths.FS{
+				tc.MainModuleDir.Join("proto"),
+			})
 
 			if len(test.wantErrs) > 0 {
 				defer tc.DeferExpectError(test.wantErrs...)
@@ -123,27 +112,38 @@ package foo
 
 			pkg := l.MustLoadPkg(token.NoPos, "example.com")
 			f := pkg.Files[0]
-			fd := testutil.FindNodes[*ast.FuncDecl](f.AST())[0]
+			gd := testutil.FindNodes[*ast.GenDecl](f.AST())[1]
 
 			// Parse the directive from the func declaration.
-			dir, doc, ok := directive.Parse(tc.Errs, fd.Doc)
+			dir, doc, ok := directive.Parse(tc.Errs, gd.Doc)
 			c.Assert(ok, qt.IsTrue)
 
-			pd := ParseData{
+			pd := servicestruct.ParseData{
 				Errs:   tc.Errs,
+				Proto:  protoParser,
 				Schema: schemaParser,
 				File:   f,
-				Func:   fd,
+				Decl:   gd,
 				Dir:    dir,
 				Doc:    doc,
 			}
 
-			got := Parse(pd)
-
+			var endpoints []*api.GRPCEndpoint
+			if ss := servicestruct.Parse(tc.Ctx, pd); ss != nil {
+				if proto, ok := ss.Proto.Get(); ok {
+					endpoints = grpcservice.ParseEndpoints(grpcservice.ServiceDesc{
+						Errs:   tc.Errs,
+						Proto:  proto,
+						Schema: schemaParser,
+						Pkg:    pd.File.Pkg,
+						Decl:   ss.Decl,
+					})
+				}
+			}
 			if len(test.wantErrs) == 0 {
 				// Check for equality, ignoring all the AST nodes and pkginfo types.
 				cmpEqual := qt.CmpEquals(
-					cmpopts.IgnoreInterfaces(struct{ ast.Node }{}),
+					cmpopts.IgnoreInterfaces(struct{ protoreflect.MethodDescriptor }{}),
 					cmpopts.IgnoreTypes(&schema.FuncDecl{}, &schema.TypeDecl{}, &pkginfo.File{}, &pkginfo.Package{}, token.Pos(0)),
 					cmpopts.EquateEmpty(),
 					cmpopts.IgnoreUnexported(schema.StructField{}, schema.NamedType{}),
@@ -151,7 +151,7 @@ package foo
 						return a.ImportPath == b.ImportPath
 					}),
 				)
-				c.Assert(got, cmpEqual, test.want)
+				c.Assert(endpoints, cmpEqual, test.want)
 			}
 		})
 	}
